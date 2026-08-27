@@ -1,83 +1,102 @@
 import torch
 import torch.optim as optim
-import matplotlib.pyplot as plt
 
 # Import custom modules
-from dataset import get_elliptic_dataset
-from models.baselines import BaselineMLP, BaselineGCN
+from dataset import get_elliptic_dataset, build_temporal_snapshot_cache
+from models.st_gnn import SpatioTemporalGNN
 from loss import get_weighted_bce_loss
-from evaluate import evaluate_model
+from evaluate import evaluate_stgnn, tune_optimal_threshold
 
-def train_model(model, data, epochs=100, lr=0.01, weight_decay=1e-5):
-    # Setup M4 Mac hardware acceleration (MPS) or fallback to CPU
+def train_stgnn_model(model, data, epochs=50, lr=0.001, lookback=3):
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"--- Training on Device: {device} ---")
+    print(f"--- Training ST-GNN on Device: {device} ---")
     
     model = model.to(device)
     data = data.to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = get_weighted_bce_loss(device)
-    
-    # Ensure y is a float tensor of shape (N, 1) for BCEWithLogitsLoss
     labels = data.y.float().unsqueeze(1)
     
-    best_val_f1 = 0.0
+    print("Building temporal snapshot cache...")
+    snapshots = build_temporal_snapshot_cache(data)
+    time_steps = sorted(snapshots.keys())
     
-    print(f"Starting Training: {model.__class__.__name__}")
+    best_val_f1 = 0.0
+    optimal_tau = 0.50
+    
+    print(f"Starting Training: {model.__class__.__name__} with Lookback T={lookback}")
     for epoch in range(1, epochs + 1):
         model.train()
-        optimizer.zero_grad()
+        epoch_loss = 0.0
+        batches = 0
         
-        # Forward pass (Static GCN needs edge_index, MLP ignores it)
-        logits = model(data.x, data.edge_index)
-        
-        # Apply the semi-supervised train mask
-        train_logits = logits[data.custom_train_mask]
-        train_labels = labels[data.custom_train_mask]
-        
-        # Compute loss ONLY on known training nodes
-        loss = criterion(train_logits, train_labels)
-        
-        # Backpropagation
-        loss.backward()
-        optimizer.step()
-        
-        # Evaluate on Validation Set every 10 epochs
-        if epoch % 10 == 0:
-            val_metrics = evaluate_model(model, data, data.custom_val_mask)
-            val_f1 = val_metrics['F1 (Illicit)']
+        # Mini-batch by sliding temporal window
+        for t in time_steps:
+            if t < lookback or t > 30: # Only train on steps <= 30
+                continue
+                
+            node_mask_t = snapshots[t]['node_mask']
+            train_mask_t = data.custom_train_mask & node_mask_t
             
-            print(f"Epoch {epoch:03d} | Loss: {loss.item():.4f} | Val F1 (Illicit): {val_f1:.4f} | Val PR-AUC: {val_metrics['PR-AUC']:.4f}")
+            if train_mask_t.sum() == 0:
+                continue
+                
+            # 1. Build chronological sequence [G_{t-2}, G_{t-1}, G_t]
+            x_seq = [snapshots[step]['x'] for step in range(t - lookback + 1, t + 1)]
+            edge_idx_seq = [snapshots[step]['edge_index'] for step in range(t - lookback + 1, t + 1)]
             
-            # Save the best model
-            if val_f1 > best_val_f1:
-                best_val_f1 = val_f1
-                # Optional: torch.save(model.state_dict(), f"../data/{model.__class__.__name__}_best.pt")
+            # 2. Forward pass
+            optimizer.zero_grad()
+            logits = model(x_seq, edge_idx_seq)
+            
+            # 3. Loss & Backprop ONLY on known nodes at time step t
+            loss = criterion(logits[train_mask_t], labels[train_mask_t])
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            batches += 1
+            
+        avg_loss = epoch_loss / max(1, batches)
+        
+        # Evaluate every 5 epochs
+        if epoch % 5 == 0:
+            # First, evaluate on validation set with default threshold to get raw probs
+            val_metrics = evaluate_stgnn(model, data, snapshots, data.custom_val_mask, lookback, threshold=0.5)
+            
+            # Tune threshold tau on Validation probabilities
+            tau_star, tuned_f1 = tune_optimal_threshold(val_metrics["Raw_Probs"], val_metrics["Raw_Labels"])
+            
+            print(f"Epoch {epoch:03d} | Avg Loss: {avg_loss:.4f} | Val PR-AUC: {val_metrics['PR-AUC']:.4f} | Tuned Val F1: {tuned_f1:.4f} (at τ={tau_star:.2f})")
+            
+            if tuned_f1 > best_val_f1:
+                best_val_f1 = tuned_f1
+                optimal_tau = tau_star
 
-    # Final Out-of-Sample Test Evaluation
-    print(f"\n--- Final Test Set Evaluation ({model.__class__.__name__}) ---")
-    test_metrics = evaluate_model(model, data, data.custom_test_mask)
-    for k, v in test_metrics.items():
-        print(f"Test {k}: {v:.4f}")
+    # --- Out-of-Sample Final Evaluation ---
+    print(f"\n--- Final Test Set Evaluation (Steps 35-49) ---")
+    print(f"Applying optimal decision boundary: τ* = {optimal_tau:.2f}")
+    
+    test_metrics = evaluate_stgnn(model, data, snapshots, data.custom_test_mask, lookback, threshold=optimal_tau)
+    
+    print(f"Test F1 (Illicit): {test_metrics['F1 (Illicit)']:.4f}")
+    print(f"Test Precision:    {test_metrics['Precision']:.4f}")
+    print(f"Test Recall:       {test_metrics['Recall']:.4f}")
+    print(f"Test PR-AUC:       {test_metrics['PR-AUC']:.4f}")
     print("-" * 50)
     
     return test_metrics
 
 if __name__ == "__main__":
-    # 1. Load the data using our pipeline from Phase 1
     data = get_elliptic_dataset()
     
-    # 2. Train the Tier 1 Baseline (MLP - No Graph Features)
     print("\n" + "="*50)
-    print("BASELINE 1: Multi-Layer Perceptron (Tabular)")
+    print("PROPOSED MODEL: Spatio-Temporal GNN (T=3)")
     print("="*50)
-    mlp_model = BaselineMLP(in_channels=data.x.size(1))
-    train_model(mlp_model, data, epochs=100)
     
-    # 3. Train the Tier 2 Baseline (Static GCN - Graph Topology added)
-    print("\n" + "="*50)
-    print("BASELINE 2: Static Graph Convolutional Network (GCN)")
-    print("="*50)
-    gcn_model = BaselineGCN(in_channels=data.x.size(1))
-    train_model(gcn_model, data, epochs=100)
+    # Initialize the decoupled ST-GNN
+    st_model = SpatioTemporalGNN(in_channels=data.x.size(1), spatial_dim=32, rnn_hidden=32)
+    
+    # Train and evaluate
+    train_stgnn_model(st_model, data, epochs=30, lookback=3)

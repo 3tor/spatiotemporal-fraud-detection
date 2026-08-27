@@ -34,29 +34,29 @@ def evaluate_model(model, data, mask, threshold=0.5):
         "PR-AUC": pr_auc
     }
 
-def tune_optimal_threshold(model, data, val_mask, step=0.05):
-    """
-    Sweeps thresholds τ ∈ [0.10, 0.90] on validation data to maximize Illicit F1.
-    """
-    model.eval()
-    with torch.no_grad():
-        logits = model(data.x, data.edge_index) if not isinstance(model, SpatioTemporalGNN_Wrapper) else model.predict(data)
-        probs = torch.sigmoid(logits).squeeze()
+# def tune_optimal_threshold(model, data, val_mask, step=0.05):
+#     """
+#     Sweeps thresholds τ ∈ [0.10, 0.90] on validation data to maximize Illicit F1.
+#     """
+#     model.eval()
+#     with torch.no_grad():
+#         logits = model(data.x, data.edge_index) if not isinstance(model, SpatioTemporalGNN_Wrapper) else model.predict(data)
+#         probs = torch.sigmoid(logits).squeeze()
         
-        masked_probs = probs[val_mask].cpu().numpy()
-        masked_labels = data.y[val_mask].cpu().numpy()
+#         masked_probs = probs[val_mask].cpu().numpy()
+#         masked_labels = data.y[val_mask].cpu().numpy()
         
-        best_threshold = 0.50
-        best_val_f1 = 0.0
+#         best_threshold = 0.50
+#         best_val_f1 = 0.0
         
-        for tau in np.arange(0.10, 0.90, step):
-            preds = (masked_probs >= tau).astype(int)
-            f1 = f1_score(masked_labels, preds, pos_label=1, zero_division=0)
-            if f1 > best_val_f1:
-                best_val_f1 = f1
-                best_threshold = tau
+#         for tau in np.arange(0.10, 0.90, step):
+#             preds = (masked_probs >= tau).astype(int)
+#             f1 = f1_score(masked_labels, preds, pos_label=1, zero_division=0)
+#             if f1 > best_val_f1:
+#                 best_val_f1 = f1
+#                 best_threshold = tau
                 
-    return best_threshold, best_val_f1
+#     return best_threshold, best_val_f1
 
 def tune_optimal_threshold(probs, labels, step=0.05):
     """
@@ -114,12 +114,36 @@ def evaluate_stgnn(model, data, snapshots, mask, lookback=3, threshold=0.5):
     final_labels = torch.cat(all_labels).numpy()
     
     preds = (final_probs >= threshold).astype(int)
+
+    # Calculate per-timestep F1 for plotting
+    per_timestep_f1 = {}
+    idx_offset = 0
+    for t in time_steps:
+        if t < lookback or t < 35: # We only care about plotting the Test set (35-49)
+            continue
+            
+        node_mask_t = snapshots[t]['node_mask']
+        eval_mask_t = mask & node_mask_t
+        num_nodes = eval_mask_t.sum().item()
+        
+        if num_nodes == 0:
+            continue
+            
+        t_labels = final_labels[idx_offset : idx_offset + num_nodes]
+        t_preds = preds[idx_offset : idx_offset + num_nodes]
+        
+        # Only calculate F1 if there are actually illicit nodes in this time step
+        if t_labels.sum() > 0:
+            per_timestep_f1[t] = f1_score(t_labels, t_preds, pos_label=1, zero_division=0)
+        
+        idx_offset += num_nodes
     
     return {
         "F1 (Illicit)": f1_score(final_labels, preds, pos_label=1, zero_division=0),
         "Precision": precision_score(final_labels, preds, pos_label=1, zero_division=0),
         "Recall": recall_score(final_labels, preds, pos_label=1, zero_division=0),
         "PR-AUC": average_precision_score(final_labels, final_probs, pos_label=1),
+        "Per_Step_F1": per_timestep_f1,  # <--- Added for plotting
         "Raw_Probs": final_probs,
         "Raw_Labels": final_labels
     }
