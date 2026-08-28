@@ -1,58 +1,88 @@
 import os
 import torch
+import numpy as np
+import random
 import matplotlib.pyplot as plt
-import seaborn as sns
-
-from dataset import get_elliptic_dataset
+from dataset import get_elliptic_dataset, build_temporal_snapshot_cache
 from models.st_gnn import SpatioTemporalGNN
-from train import train_stgnn_model
+from evaluate import evaluate_stgnn
 
-# --- Dynamically resolve absolute paths ---
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-FIGURES_DIR = os.path.join(PROJECT_ROOT, "figures")
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def plot_temporal_drift(metrics_dict, save_path=os.path.join(FIGURES_DIR, "temporal_drift.png")):
-    """
-    Generates a line plot showing the F1 score at each test time step.
-    """
-    # Ensure the figures directory actually exists
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+def plot_concept_drift():
+    set_seed(42)
     
-    sns.set_theme(style="whitegrid")
+    print("Loading Dataset...")
+    data = get_elliptic_dataset()
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    data = data.to(device)
+
+    snapshots = build_temporal_snapshot_cache(data)
+    
+    # Initialize empty model
+    model = SpatioTemporalGNN(in_channels=data.x.size(1), spatial_dim=32, rnn_hidden=32).to(device)
+    
+    # Load the trained weights
+    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "checkpoints", "SpatioTemporalGNN_best.pt"))
+    if not os.path.exists(checkpoint_path):
+        print(f"Error: Could not find checkpoint at {checkpoint_path}. Run train.py first.")
+        return
+        
+    print("Loading pre-trained ST-GNN weights...")
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
+    model.eval()
+
+    # We will evaluate chronologically on the Test Set (Steps 35-49)
+    test_steps = list(range(35, 50))
+    f1_scores = []
+    
+    optimal_tau = 0.85 # Using the threshold from training
+    lookback = 3
+    
+    print("Evaluating per timestep...")
+    for t in test_steps:
+        # Create a temporary mask that ONLY isolates the current timestep
+        step_mask = (data.time_step == t) & data.custom_test_mask
+        
+        if step_mask.sum() == 0:
+            f1_scores.append(0)
+            continue
+            
+        metrics = evaluate_stgnn(model, data, snapshots, step_mask, lookback, threshold=optimal_tau)
+        f1_scores.append(metrics['F1 (Illicit)'])
+        print(f"Step {t} | F1: {metrics['F1 (Illicit)']:.4f}")
+
+    # --- PLOT CONCEPT DRIFT ---
+    print("\nGenerating Concept Drift Chart...")
     plt.figure(figsize=(10, 5))
+    plt.plot(test_steps, f1_scores, marker='o', linestyle='-', color='#d62728', linewidth=2, label="ST-GNN (T=3)")
     
-    # Extract time steps and F1 scores
-    steps = list(metrics_dict.keys())
-    f1_scores = list(metrics_dict.values())
+    # Highlight the darknet shutdown event (Concept Drift)
+    plt.axvline(x=43, color='black', linestyle='--', alpha=0.6)
+    plt.text(42.8, max(f1_scores)*0.85, 'Darknet Market\nShutdown (Step 43)', 
+             horizontalalignment='right', fontsize=10, bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+    plt.title('Model Resilience Under Concept Drift (Test Set)')
+    plt.xlabel('Chronological Time Step (approx. 2 weeks each)')
+    plt.ylabel('Illicit F1-Score')
+    plt.xticks(test_steps)
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend()
     
-    # Plot the ST-GNN trajectory
-    plt.plot(steps, f1_scores, marker='o', linestyle='-', linewidth=2, color='#2c3e50', label="ST-GNN (T=3)")
-    
-    # Highlight the "Darknet Shutdown" structural shift (~Step 43)
-    plt.axvline(x=43, color='#e74c3c', linestyle='--', alpha=0.7, label="Major Market Shutdown (Step 43)")
-    
-    plt.title("Model Resilience Under Temporal Concept Drift (Steps 35-49)", fontsize=14, pad=15)
-    plt.xlabel("Temporal Snapshot (t)", fontsize=12)
-    plt.ylabel("Minority F1-Score (Illicit)", fontsize=12)
-    plt.ylim(0, 1.0)
-    plt.xticks(range(35, 50))
-    plt.legend(loc="lower left")
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
-    print(f"\n✅ Plot saved successfully to: {save_path}")
+    # Save figure
+    fig_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "figures"))
+    os.makedirs(fig_dir, exist_ok=True)
+    fig_path = os.path.join(fig_dir, "temporal_drift.png")
+    plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+    print(f"Drift chart saved to: {fig_path}")
 
 if __name__ == "__main__":
-    # 1. Load data
-    data = get_elliptic_dataset()
-    
-    # 2. Re-initialize and train the model quickly
-    st_model = SpatioTemporalGNN(in_channels=data.x.size(1), spatial_dim=32, rnn_hidden=32)
-    test_metrics = train_stgnn_model(st_model, data, epochs=30, lookback=3)
-    
-    # 3. Generate the drift plot
-    if "Per_Step_F1" in test_metrics:
-        plot_temporal_drift(test_metrics["Per_Step_F1"])
-    else:
-        print("Error: 'Per_Step_F1' not found in test metrics.")
+    plot_concept_drift()
