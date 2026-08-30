@@ -99,7 +99,7 @@ def train_stgnn_model(model, data, epochs=30, lr=0.001, lookback=3):
                 
                 checkpoint_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "checkpoints"))
                 os.makedirs(checkpoint_dir, exist_ok=True)
-                checkpoint_path = os.path.join(checkpoint_dir, f"{model.__class__.__name__}_best.pt")
+                checkpoint_path = os.path.join(checkpoint_dir, f"SpatioTemporalGNN_T{lookback}_best.pt")
                 torch.save(model.state_dict(), checkpoint_path)
                 print(f"Epoch {epoch:03d} | Tuned Val F1: {tuned_f1:.4f} (at τ={tau_star:.2f}) -> [!] Checkpoint Saved")
 
@@ -122,29 +122,23 @@ def train_stgnn_model(model, data, epochs=30, lr=0.001, lookback=3):
     return test_metrics
 
 if __name__ == "__main__":
-    # 1. Lock the seed for exact reproducibility
-    set_seed(42)
-    
     print("Loading Dataset...")
     data = get_elliptic_dataset()
     
     # 2. Train Tabular MLP Baseline
-    print("\n" + "="*50)
-    print("BASELINE 1: Multi-Layer Perceptron (Tabular)")
-    print("="*50)
+    print("\n" + "="*50 + "\nBASELINE 1: Multi-Layer Perceptron (Tabular)\n" + "="*50)
+    set_seed(42) # Reset seed for MLP
     mlp_model = BaselineMLP(in_channels=data.x.size(1))
     train_baseline_model(mlp_model, data, epochs=100)
     
     # 3. Train Static GCN Baseline
-    print("\n" + "="*50)
-    print("BASELINE 2: Static Graph Convolutional Network (GCN)")
-    print("="*50)
+    print("\n" + "="*50 + "\nBASELINE 2: Static Graph Convolutional Network (GCN)\n" + "="*50)
+    set_seed(42) # Reset seed for GCN
     gcn_model = BaselineGCN(in_channels=data.x.size(1))
     train_baseline_model(gcn_model, data, epochs=100)
     
     # 4. Train ST-GNN
-    print("\n" + "="*50)
-    print("PROPOSED MODEL: Spatio-Temporal GNN (T=3)")
-    print("="*50)
+    print("\n" + "="*50 + "\nPROPOSED MODEL: Spatio-Temporal GNN (T=3)\n" + "="*50)
+    set_seed(42) # <-- FIX: Reset seed right before ST-GNN!
     st_model = SpatioTemporalGNN(in_channels=data.x.size(1), spatial_dim=32, rnn_hidden=32)
     train_stgnn_model(st_model, data, epochs=30, lookback=3)
